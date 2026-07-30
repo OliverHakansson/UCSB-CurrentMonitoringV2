@@ -1,0 +1,777 @@
+import json
+import os
+import re
+import threading
+import time
+import tkinter as tk
+from tkinter import messagebox, ttk
+
+import pyvisa
+
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def is_valid_email(email):
+    return bool(EMAIL_PATTERN.match(email))
+
+
+def writeToTXT(elapsed_time, current_value):
+    """Helper function to log measurement data to standard output or a text file."""
+    print(f"[DATA] Time: {elapsed_time:.3f} s | Conductivity: {current_value:.6e} A")
+
+
+TAB_NAMES = ["Tab 1", "Tab 2", "Tab 3"]
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROFILES_PATH = os.path.join(SCRIPT_DIR, "profiles.json")
+CHIPS_PATH = os.path.join(SCRIPT_DIR, "chips.json")
+
+DEFAULT_PROFILES = [{"Name": "Me", "Email": "me@example.com"}]
+DEFAULT_CHIPS = [{"Chip Name": "Sample Chip", "Chip Dimensions": "10mm x 10mm"}]
+
+
+def load_json(path, default):
+    if not os.path.exists(path):
+        save_json(path, default)
+        return [dict(item) for item in default]
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    save_json(path, default)
+    return [dict(item) for item in default]
+
+
+def save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+class VerticalTabsApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Pennathur Lab Current Monitoring GUI by Oliver Hakansson TM")
+        self.geometry("900x550")
+
+        self.active_tab = tk.StringVar(value="Tab 1")
+        self.tab_buttons = {}
+        self.tab_frames = {}  # name -> frame containing that tab's widgets
+
+        # PyVISA / Keithley instrument variables
+        self.rm = None
+        self.keithley = None
+
+        # In-memory copies of the two JSON files
+        self.profiles = load_json(PROFILES_PATH, DEFAULT_PROFILES)
+        self.chips = load_json(CHIPS_PATH, DEFAULT_CHIPS)
+
+        # Track which list entry (if any) is currently selected
+        self.selected_profile_index = None
+        self.selected_chip_index = None
+
+        # Tab 2 experiment-builder state
+        self.voltages = []      # list of floats currently staged
+        self.timings = []       # list of floats (seconds) currently staged
+        self.experiments = []   # list of {"voltages": [...], "timings": [...], "loops": int}
+
+        self._build_layout()
+        self._refresh_visa_resources()
+        self._select_tab("Tab 1")  # initialize with first tab selected
+
+        # Handle window closure cleanly
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ---------------- Keithley Connection Management ----------------
+    def _refresh_visa_resources(self):
+        """Discovers available VISA devices and populates the drop-down menu."""
+        try:
+            if self.rm is None:
+                self.rm = pyvisa.ResourceManager()
+            resources = self.rm.list_resources()
+            self.visa_combo["values"] = list(resources)
+            if resources:
+                self.visa_combo.current(0)
+            else:
+                self.visa_combo.set("No devices found")
+        except Exception:
+            self.visa_combo["values"] = []
+            self.visa_combo.set("VISA Error")
+
+    def connect_keithley(self):
+        """Attempts to establish a connection with the selected Keithley instrument."""
+        if self.keithley is not None:
+            messagebox.showinfo("Already Connected", "Keithley is already connected.")
+            return True
+
+        selected_address = self.visa_combo.get().strip()
+        if not selected_address or selected_address in ["No devices found", "VISA Error"]:
+            messagebox.showwarning("Selection Error", "Please select a valid VISA instrument address.")
+            return False
+
+        try:
+            if self.rm is None:
+                self.rm = pyvisa.ResourceManager()
+
+            self.keithley = self.rm.open_resource(selected_address)
+            self.keithley.timeout = 5000
+            idn = self.keithley.query("*IDN?")
+            print(f"[Keithley] Successfully connected: {idn.strip()}")
+
+            self.status_lbl.config(text="Status: Connected", foreground="green")
+            return True
+        except Exception as e:
+            messagebox.showerror("Connection Failed", f"Could not connect to {selected_address}:\n{e}")
+            self.disconnect_keithley()
+            return False
+
+    def disconnect_keithley(self):
+        """Safely disconnects and clears instrument resources."""
+        if self.keithley is not None:
+            try:
+                self.keithley.close()
+            except Exception:
+                pass
+            finally:
+                self.keithley = None
+
+        self.status_lbl.config(text="Status: Disconnected", foreground="red")
+
+    # ---------------- Layout Construction ----------------
+    def _build_layout(self):
+        container = ttk.Frame(self, padding=10)
+        container.pack(fill="both", expand=True)
+
+        # --- Left: vertical tab buttons ---
+        style = ttk.Style()
+        style.configure(
+            "Tab.TButton",
+            padding=0,
+            font=("TkDefaultFont", 8),
+        )
+
+        tab_bar = ttk.Frame(container)
+        tab_bar.pack(side="left", fill="y", padx=(0, 10))
+
+        for name in TAB_NAMES:
+            btn = ttk.Button(
+                tab_bar,
+                text=name,
+                width=8,
+                style="Tab.TButton",
+                command=lambda n=name: self._select_tab(n),
+            )
+            btn.pack(side="top", fill="x", pady=0)
+            self.tab_buttons[name] = btn
+
+        # --- Resizable area: content pane (middle) + side pane (right) ---
+        paned = ttk.PanedWindow(container, orient="horizontal")
+        paned.pack(side="left", fill="both", expand=True)
+
+        content_frame = ttk.LabelFrame(paned, text="Tab Content", padding=10)
+        content_frame.rowconfigure(0, weight=1)
+        content_frame.columnconfigure(0, weight=1)
+
+        self._build_tab1(content_frame)
+        self._build_tab2(content_frame)
+        self._build_tab3(content_frame)
+
+        # --- Right: static side panels ---
+        side_column = ttk.Frame(paned)
+        side_column.rowconfigure(0, weight=1)
+        side_column.rowconfigure(1, weight=2)
+        side_column.columnconfigure(0, weight=1)
+
+        # Top Right Panel: Connection Status & Device Selection
+        self.side_box_top = ttk.LabelFrame(side_column, text="Keithley Connection", padding=10)
+        self.side_box_top.grid(row=0, column=0, sticky="nsew")
+        self.side_box_top.columnconfigure(1, weight=1)
+
+        # Status Label
+        self.status_lbl = ttk.Label(
+            self.side_box_top,
+            text="Status: Disconnected",
+            foreground="red",
+            font=("TkDefaultFont", 9, "bold"),
+        )
+        self.status_lbl.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+        # Device Selection Combobox
+        ttk.Label(self.side_box_top, text="Device:").grid(row=1, column=0, sticky="w", pady=4)
+        self.visa_combo = ttk.Combobox(self.side_box_top, state="readonly")
+        self.visa_combo.grid(row=1, column=1, sticky="ew", pady=4, padx=(4, 0))
+
+        # Refresh, Connect, Disconnect Action Buttons
+        btn_frame = ttk.Frame(self.side_box_top)
+        btn_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+        ttk.Button(btn_frame, text="Refresh", command=self._refresh_visa_resources).pack(side="left", padx=(0, 2))
+        ttk.Button(btn_frame, text="Connect", command=self.connect_keithley).pack(side="left", padx=2)
+        ttk.Button(btn_frame, text="Disconnect", command=self.disconnect_keithley).pack(side="left", padx=2)
+
+        # Bottom Right Panel: Logs
+        side_box_bottom = ttk.LabelFrame(side_column, text="Logs", padding=8)
+        side_box_bottom.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+
+        paned.add(content_frame, weight=3)
+        paned.add(side_column, weight=2)
+
+    def _make_list_box(self, parent, label_text, row, height=4):
+        box_frame = ttk.LabelFrame(parent, text=label_text, padding=4)
+        box_frame.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(0, 8))
+        box_frame.columnconfigure(0, weight=1)
+
+        listbox = tk.Listbox(box_frame, height=height, exportselection=False)
+        listbox.grid(row=0, column=0, sticky="ew")
+
+        scrollbar = ttk.Scrollbar(box_frame, orient="vertical", command=listbox.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        listbox.config(yscrollcommand=scrollbar.set)
+
+        return listbox
+
+    def _build_tab1(self, parent):
+        frame = ttk.Frame(parent)
+        frame.grid(row=0, column=0, sticky="nsew")
+        self.tab_frames["Tab 1"] = frame
+
+        # --- Profiles list ---
+        self.tab1_profile_listbox = self._make_list_box(
+            frame, "Profiles (click to select)", row=0
+        )
+        self.tab1_profile_listbox.bind("<<ListboxSelect>>", self._on_profile_select)
+
+        ttk.Label(frame, text="Name:").grid(row=1, column=0, sticky="w", pady=4)
+        self.tab1_name_entry = ttk.Entry(frame)
+        self.tab1_name_entry.grid(row=1, column=1, sticky="ew", pady=4)
+        self.tab1_name_entry.bind("<KeyRelease>", self._clear_profile_selection)
+
+        ttk.Label(frame, text="Email:").grid(row=1, column=2, sticky="w", pady=4)
+        self.tab1_email_entry = ttk.Entry(frame)
+        self.tab1_email_entry.grid(row=1, column=3, sticky="ew", pady=4)
+        self.tab1_email_entry.bind("<KeyRelease>", self._clear_profile_selection)
+
+        ttk.Button(
+            frame, text="Add Profile", command=self._add_or_update_profile
+        ).grid(row=2, column=0, pady=(4, 12), sticky="w")
+
+        ttk.Button(
+            frame, text="Delete Profile", command=self._delete_profile
+        ).grid(row=2, column=1, pady=(4, 12), sticky="w")
+
+        # --- Chips list ---
+        self.tab1_chip_listbox = self._make_list_box(
+            frame, "Chips (click to select)", row=3
+        )
+        self.tab1_chip_listbox.bind("<<ListboxSelect>>", self._on_chip_select)
+
+        ttk.Label(frame, text="Chip Name:").grid(row=4, column=0, sticky="w", pady=4)
+        self.tab1_chip_name_entry = ttk.Entry(frame)
+        self.tab1_chip_name_entry.grid(row=4, column=1, sticky="ew", pady=4)
+        self.tab1_chip_name_entry.bind("<KeyRelease>", self._clear_chip_selection)
+
+        ttk.Label(frame, text="Chip Dimensions:").grid(row=4, column=2, sticky="w", pady=4)
+        self.tab1_chip_dimensions_entry = ttk.Entry(frame)
+        self.tab1_chip_dimensions_entry.grid(row=4, column=3, sticky="ew", pady=4)
+        self.tab1_chip_dimensions_entry.bind("<KeyRelease>", self._clear_chip_selection)
+
+        ttk.Button(
+            frame, text="Add Chip", command=self._add_or_update_chip
+        ).grid(row=5, column=0, pady=(4, 0), sticky="w")
+
+        ttk.Button(
+            frame, text="Delete Chip", command=self._delete_chip
+        ).grid(row=5, column=1, pady=(4, 0), sticky="w")
+
+        frame.columnconfigure(1, weight=1)
+        frame.columnconfigure(3, weight=1)
+
+        # --- Experiment Name Field ---
+        ttk.Label(frame, text="Session Name:").grid(row=6, column=0, sticky="w", pady=4)
+        self.tab1_experiment_name_entry = ttk.Entry(frame)
+        self.tab1_experiment_name_entry.grid(row=6, column=1, sticky="ew", pady=4)
+
+        ttk.Button(
+            frame, text="Start Session", command=self._start_session
+        ).grid(row=7, column=0, pady=(8, 0), sticky="w")
+
+        self._refresh_profile_list()
+        self._refresh_chip_list()
+
+    def _start_session(self):
+        """Reads Tab 1 inputs, populates the top bar of Tab 2, and switches to Tab 2."""
+        session_data = {
+            "Session": self.tab1_experiment_name_entry.get().strip(),
+            "Name": self.tab1_name_entry.get().strip(),
+            "Email": self.tab1_email_entry.get().strip(),
+            "Chip": self.tab1_chip_name_entry.get().strip(),
+            "Dims": self.tab1_chip_dimensions_entry.get().strip(),
+        }
+
+        # Update header bar labels on Tab 2
+        self.tab2_session_lbl.config(text=session_data["Session"] or "N/A")
+        self.tab2_profile_lbl.config(
+            text=f"{session_data['Name']} ({session_data['Email']})"
+            if session_data["Name"]
+            else "N/A"
+        )
+        self.tab2_chip_lbl.config(
+            text=f"{session_data['Chip']} [{session_data['Dims']}]"
+            if session_data["Chip"]
+            else "N/A"
+        )
+
+        self._select_tab("Tab 2")
+
+    # ---------------- Profiles: list <-> fields <-> JSON ----------------
+    def _refresh_profile_list(self):
+        self.tab1_profile_listbox.delete(0, "end")
+        for profile in self.profiles:
+            name = profile.get("Name", "")
+            email = profile.get("Email", "")
+            self.tab1_profile_listbox.insert("end", f"{name}  <{email}>")
+
+    def _on_profile_select(self, event=None):
+        selection = self.tab1_profile_listbox.curselection()
+        if not selection:
+            return
+        index = selection[0]
+        self.selected_profile_index = index
+        profile = self.profiles[index]
+
+        self.tab1_name_entry.delete(0, "end")
+        self.tab1_name_entry.insert(0, profile.get("Name", ""))
+        self.tab1_email_entry.delete(0, "end")
+        self.tab1_email_entry.insert(0, profile.get("Email", ""))
+
+    def _clear_profile_selection(self, event=None):
+        if self.selected_profile_index is not None:
+            self.selected_profile_index = None
+            self.tab1_profile_listbox.selection_clear(0, "end")
+
+    def _add_or_update_profile(self):
+        name = self.tab1_name_entry.get().strip()
+        email = self.tab1_email_entry.get().strip()
+
+        if not name:
+            messagebox.showwarning("Missing name", "Please enter a name before adding a profile.")
+            return
+
+        if not is_valid_email(email):
+            messagebox.showwarning(
+                "Invalid email",
+                f"'{email}' doesn't look like a valid email address (e.g. name@example.com).",
+            )
+            return
+
+        if self.selected_profile_index is not None:
+            self.profiles[self.selected_profile_index] = {"Name": name, "Email": email}
+        else:
+            self.profiles.append({"Name": name, "Email": email})
+
+        save_json(PROFILES_PATH, self.profiles)
+        self._refresh_profile_list()
+
+    def _delete_profile(self):
+        if self.selected_profile_index is None:
+            messagebox.showinfo("No profile selected", "Click a profile in the list first to delete it.")
+            return
+
+        profile = self.profiles[self.selected_profile_index]
+        confirmed = messagebox.askyesno(
+            "Delete profile",
+            f"Are you sure you want to delete '{profile.get('Name', '')}'?",
+        )
+        if not confirmed:
+            return
+
+        del self.profiles[self.selected_profile_index]
+        save_json(PROFILES_PATH, self.profiles)
+        self.selected_profile_index = None
+        self.tab1_name_entry.delete(0, "end")
+        self.tab1_email_entry.delete(0, "end")
+        self._refresh_profile_list()
+
+    # ---------------- Chips: list <-> fields <-> JSON ----------------
+    def _refresh_chip_list(self):
+        self.tab1_chip_listbox.delete(0, "end")
+        for chip in self.chips:
+            chip_name = chip.get("Chip Name", "")
+            dims = chip.get("Chip Dimensions", "")
+            self.tab1_chip_listbox.insert("end", f"{chip_name}  ({dims})")
+
+    def _on_chip_select(self, event=None):
+        selection = self.tab1_chip_listbox.curselection()
+        if not selection:
+            return
+        index = selection[0]
+        self.selected_chip_index = index
+        chip = self.chips[index]
+
+        self.tab1_chip_name_entry.delete(0, "end")
+        self.tab1_chip_name_entry.insert(0, chip.get("Chip Name", ""))
+        self.tab1_chip_dimensions_entry.delete(0, "end")
+        self.tab1_chip_dimensions_entry.insert(0, chip.get("Chip Dimensions", ""))
+
+    def _clear_chip_selection(self, event=None):
+        if self.selected_chip_index is not None:
+            self.selected_chip_index = None
+            self.tab1_chip_listbox.selection_clear(0, "end")
+
+    def _add_or_update_chip(self):
+        chip_name = self.tab1_chip_name_entry.get().strip()
+        dims = self.tab1_chip_dimensions_entry.get().strip()
+
+        if not chip_name:
+            messagebox.showwarning("Missing chip name", "Please enter a chip name before adding a chip.")
+            return
+
+        if self.selected_chip_index is not None:
+            self.chips[self.selected_chip_index] = {"Chip Name": chip_name, "Chip Dimensions": dims}
+        else:
+            self.chips.append({"Chip Name": chip_name, "Chip Dimensions": dims})
+
+        save_json(CHIPS_PATH, self.chips)
+        self._refresh_chip_list()
+
+    def _delete_chip(self):
+        if self.selected_chip_index is None:
+            messagebox.showinfo("No chip selected", "Click a chip in the list first to delete it.")
+            return
+
+        chip = self.chips[self.selected_chip_index]
+        confirmed = messagebox.askyesno(
+            "Delete chip",
+            f"Are you sure you want to delete '{chip.get('Chip Name', '')}'?",
+        )
+        if not confirmed:
+            return
+
+        del self.chips[self.selected_chip_index]
+        save_json(CHIPS_PATH, self.chips)
+        self.selected_chip_index = None
+        self.tab1_chip_name_entry.delete(0, "end")
+        self.tab1_chip_dimensions_entry.delete(0, "end")
+        self._refresh_chip_list()
+
+    # ---------------- Tab 2 Construction ----------------
+    def _build_tab2(self, parent):
+        frame = ttk.Frame(parent)
+        frame.grid(row=0, column=0, sticky="nsew")
+        self.tab_frames["Tab 2"] = frame
+
+        # --- Horizontal Header Bar Across the Top ---
+        header_bar = ttk.Frame(frame, padding=(6, 4))
+        header_bar.pack(fill="x", side="top", pady=(0, 10))
+
+        ttk.Label(header_bar, text="Session:", font=("TkDefaultFont", 9, "bold")).pack(side="left", padx=(0, 2))
+        self.tab2_session_lbl = ttk.Label(header_bar, text="Not started")
+        self.tab2_session_lbl.pack(side="left", padx=(0, 15))
+
+        ttk.Label(header_bar, text="Profile:", font=("TkDefaultFont", 9, "bold")).pack(side="left", padx=(0, 2))
+        self.tab2_profile_lbl = ttk.Label(header_bar, text="N/A")
+        self.tab2_profile_lbl.pack(side="left", padx=(0, 15))
+
+        ttk.Label(header_bar, text="Chip:", font=("TkDefaultFont", 9, "bold")).pack(side="left", padx=(0, 2))
+        self.tab2_chip_lbl = ttk.Label(header_bar, text="N/A")
+        self.tab2_chip_lbl.pack(side="left", padx=(0, 5))
+
+        ttk.Separator(frame, orient="horizontal").pack(fill="x", side="top", pady=(0, 10))
+
+        # Body area for Tab 2 content: experiment builder
+        body_frame = ttk.Frame(frame)
+        body_frame.pack(fill="both", expand=True)
+
+        # --- Voltages input list ---
+        voltages_frame = ttk.LabelFrame(body_frame, text="Voltages (V)", padding=8)
+        voltages_frame.pack(fill="x", pady=(0, 8))
+        voltages_frame.columnconfigure(0, weight=1)
+
+        self.tab2_voltage_listbox = tk.Listbox(voltages_frame, height=4, exportselection=False)
+        self.tab2_voltage_listbox.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 4))
+
+        self.tab2_voltage_entry = ttk.Entry(voltages_frame, width=12)
+        self.tab2_voltage_entry.grid(row=1, column=0, sticky="w")
+        self.tab2_voltage_entry.bind("<Return>", lambda e: self._add_voltage())
+
+        ttk.Button(voltages_frame, text="Add Voltage", command=self._add_voltage).grid(
+            row=1, column=1, padx=4
+        )
+        ttk.Button(
+            voltages_frame, text="Remove Selected", command=self._remove_voltage
+        ).grid(row=1, column=2)
+
+        # --- Timings input list ---
+        timings_frame = ttk.LabelFrame(body_frame, text="Timings (s)", padding=8)
+        timings_frame.pack(fill="x", pady=(0, 8))
+        timings_frame.columnconfigure(0, weight=1)
+
+        self.tab2_timing_listbox = tk.Listbox(timings_frame, height=4, exportselection=False)
+        self.tab2_timing_listbox.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 4))
+
+        self.tab2_timing_entry = ttk.Entry(timings_frame, width=12)
+        self.tab2_timing_entry.grid(row=1, column=0, sticky="w")
+        self.tab2_timing_entry.bind("<Return>", lambda e: self._add_timing())
+
+        ttk.Button(timings_frame, text="Add Timing", command=self._add_timing).grid(
+            row=1, column=1, padx=4
+        )
+        ttk.Button(
+            timings_frame, text="Remove Selected", command=self._remove_timing
+        ).grid(row=1, column=2)
+
+        # --- Experiment loops ---
+        loops_frame = ttk.Frame(body_frame)
+        loops_frame.pack(fill="x", pady=(0, 8))
+        ttk.Label(loops_frame, text="Experiment Loops:").pack(side="left", padx=(0, 6))
+        self.tab2_loops_entry = ttk.Entry(loops_frame, width=10)
+        self.tab2_loops_entry.pack(side="left")
+
+        # --- Add Experiment button ---
+        ttk.Button(
+            body_frame, text="Add Experiment", command=self._add_experiment
+        ).pack(anchor="w", pady=(0, 10))
+
+        # --- Queued experiments list ---
+        experiments_frame = ttk.LabelFrame(body_frame, text="Experiments Queue", padding=8)
+        experiments_frame.pack(fill="both", expand=True)
+        experiments_frame.columnconfigure(0, weight=1)
+        experiments_frame.rowconfigure(0, weight=1)
+
+        self.tab2_experiments_listbox = tk.Listbox(experiments_frame, height=6, exportselection=False)
+        self.tab2_experiments_listbox.grid(row=0, column=0, sticky="nsew")
+
+        exp_scrollbar = ttk.Scrollbar(
+            experiments_frame, orient="vertical", command=self.tab2_experiments_listbox.yview
+        )
+        exp_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.tab2_experiments_listbox.config(yscrollcommand=exp_scrollbar.set)
+
+        # --- Run Experiments Button ---
+        ttk.Button(
+            body_frame, text="Run Experiments", command=self._start_experiments_thread
+        ).pack(anchor="w", pady=(8, 0))
+
+    # ---------------- Tab 2: Execution & Validation ----------------
+    def _start_experiments_thread(self):
+        if not self.experiments:
+            messagebox.showwarning("Empty Queue", "There are no experiments in the queue to run.")
+            return
+
+        thread = threading.Thread(target=self._run_experiments, daemon=True)
+        thread.start()
+
+    def _run_experiments(self):
+        """Executes queued experiments using PyVISA commands to stream data from the Keithley."""
+        print("\n================ STARTING EXPERIMENTS ================")
+        
+        # Raise error immediately if hardware is disconnected
+        if self.keithley is None:
+            error_msg = "Cannot start experiment: Keithley instrument is not connected!"
+            print(f"[Error] {error_msg}")
+            messagebox.showerror("Connection Error", error_msg)
+            raise RuntimeError(error_msg)
+
+        print(f"Session Name : {self.tab2_session_lbl.cget('text')}")
+        print(f"Profile      : {self.tab2_profile_lbl.cget('text')}")
+        print(f"Chip Info    : {self.tab2_chip_lbl.cget('text')}")
+        print("-----------------------------------------------------")
+
+        try:
+            for idx, exp in enumerate(self.experiments, start=1):
+                print(f"\n--- Running Experiment #{idx} ---")
+                
+                experiment_data = {"data_points": []}
+                current_voltages = exp["voltages"]
+                current_timings = exp["timings"]
+                experiment_loops = exp["loops"]
+
+                # Initialize output zero and turn output ON
+                self.keithley.write("SOUR:VOLT 0")
+                self.keithley.write("OUTP ON")
+
+                experiment_start_time = time.time()
+                first_data_point = False
+
+                for h in range(experiment_loops):
+                    length = min(len(current_timings), len(current_voltages))
+                    
+                    for i in range(length):
+                        cycle_start_time = time.time()
+                        target_voltage = float(current_voltages[i])
+                        target_duration = float(current_timings[i])
+
+                        self.keithley.write(f"SOUR:VOLT {target_voltage}")
+
+                        while (cycle_start_time + target_duration) > time.time():
+                            if self.keithley is None:
+                                raise RuntimeError("Keithley connection lost mid-experiment!")
+
+                            current_val = self.keithley.query("MEAS:CURR?")
+
+                            if not first_data_point:
+                                first_data_point = True
+                                experiment_start_time = time.time()
+
+                            elapsed_time = time.time() - experiment_start_time
+                            current_value = float(current_val.split(",")[0].split("N")[0])
+
+                            experiment_data["data_points"].append({
+                                "time": elapsed_time,
+                                "conductivity": current_value
+                            })
+
+                            writeToTXT(elapsed_time, current_value)
+
+                self.keithley.write("SOUR:VOLT 0")
+                self.keithley.write("OUTP OFF")
+
+        except Exception as e:
+            print(f"[Execution Aborted] {e}")
+            if self.keithley is not None:
+                try:
+                    self.keithley.write("SOUR:VOLT 0")
+                    self.keithley.write("OUTP OFF")
+                except Exception:
+                    pass
+        finally:
+            print("\n================ EXPERIMENT RUN COMPLETE ================\n")
+
+    # ---------------- Tab 2: Voltages list <-> entry ----------------
+    def _add_voltage(self):
+        raw = self.tab2_voltage_entry.get().strip()
+        if not raw:
+            return
+        try:
+            value = float(raw)
+        except ValueError:
+            messagebox.showwarning("Invalid voltage", f"'{raw}' is not a valid number.")
+            return
+
+        self.voltages.append(value)
+        self.tab2_voltage_listbox.insert("end", f"{value} V")
+        self.tab2_voltage_entry.delete(0, "end")
+
+    def _remove_voltage(self):
+        selection = self.tab2_voltage_listbox.curselection()
+        if not selection:
+            messagebox.showinfo(
+                "No voltage selected", "Click a voltage in the list first to remove it."
+            )
+            return
+        index = selection[0]
+        del self.voltages[index]
+        self.tab2_voltage_listbox.delete(index)
+
+    # ---------------- Tab 2: Timings list <-> entry ----------------
+    def _add_timing(self):
+        raw = self.tab2_timing_entry.get().strip()
+        if not raw:
+            return
+        try:
+            value = float(raw)
+        except ValueError:
+            messagebox.showwarning("Invalid timing", f"'{raw}' is not a valid number.")
+            return
+
+        self.timings.append(value)
+        self.tab2_timing_listbox.insert("end", f"{value} s")
+        self.tab2_timing_entry.delete(0, "end")
+
+    def _remove_timing(self):
+        selection = self.tab2_timing_listbox.curselection()
+        if not selection:
+            messagebox.showinfo(
+                "No timing selected", "Click a timing in the list first to remove it."
+            )
+            return
+        index = selection[0]
+        del self.timings[index]
+        self.tab2_timing_listbox.delete(index)
+
+    # ---------------- Tab 2: Add Experiment ----------------
+    def _add_experiment(self):
+        raw_loops = self.tab2_loops_entry.get().strip()
+        if not raw_loops:
+            messagebox.showwarning("Missing loops", "Please enter a number of experiment loops.")
+            return
+        try:
+            loops = int(raw_loops)
+        except ValueError:
+            messagebox.showwarning("Invalid loops", f"'{raw_loops}' is not a whole number.")
+            return
+
+        if not self.voltages:
+            messagebox.showwarning("No voltages", "Add at least one voltage before adding an experiment.")
+            return
+        if not self.timings:
+            messagebox.showwarning("No timings", "Add at least one timing before adding an experiment.")
+            return
+
+        if len(self.voltages) != len(self.timings):
+            messagebox.showwarning(
+                "Length Mismatch", 
+                "The number of voltages and timings must match before adding an experiment."
+            )
+            return
+
+        experiment = {
+            "voltages": list(self.voltages),
+            "timings": list(self.timings),
+            "loops": loops,
+        }
+        self.experiments.append(experiment)
+
+        summary = f"V={experiment['voltages']}  T={experiment['timings']}  Loops={loops}"
+        self.tab2_experiments_listbox.insert("end", summary)
+
+    # ---------------- Tab 3 Construction ----------------
+    def _build_tab3(self, parent):
+        frame = ttk.Frame(parent)
+        frame.grid(row=0, column=0, sticky="nsew")
+        self.tab_frames["Tab 3"] = frame
+
+        ttk.Label(frame, text="Search:").grid(row=0, column=0, sticky="w", pady=4)
+        self.tab3_search_entry = ttk.Entry(frame)
+        self.tab3_search_entry.grid(row=0, column=1, sticky="ew", pady=4)
+        ttk.Button(frame, text="Go", command=self._tab3_search).grid(
+            row=0, column=2, padx=(4, 0)
+        )
+
+        self.tab3_result_label = ttk.Label(frame, text="")
+        self.tab3_result_label.grid(row=1, column=0, columnspan=3, sticky="w", pady=8)
+
+        frame.columnconfigure(1, weight=1)
+
+    def _tab3_search(self):
+        query = self.tab3_search_entry.get()
+        self.tab3_result_label.config(text=f"You searched for: {query}")
+
+    def _select_tab(self, name):
+        self.active_tab.set(name)
+
+        for tab_name, btn in self.tab_buttons.items():
+            if tab_name == name:
+                btn.state(["pressed"])
+            else:
+                btn.state(["!pressed"])
+
+        self.tab_frames[name].tkraise()
+
+        # Hide top-right panel on Tab 3, show on Tab 1 & Tab 2
+        if name == "Tab 3":
+            self.side_box_top.grid_remove()
+        else:
+            self.side_box_top.grid()
+
+    def _on_close(self):
+        """Clean shutdown handler for window exit."""
+        self.disconnect_keithley()
+        self.destroy()
+
+
+if __name__ == "__main__":
+    app = VerticalTabsApp()
+    app.mainloop()
