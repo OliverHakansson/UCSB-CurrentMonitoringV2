@@ -19,7 +19,7 @@ def is_valid_email(email):
 
 def writeToTXT(elapsed_time, current_value,experiment_file_path):
     new_row = [f"{elapsed_time:.3f}", f"{current_value:.6e}"]
-    with open(f'{experiment_file_path}.csv', mode='a', newline='', encoding='utf-8') as file:
+    with open(f'{experiment_file_path}', mode='a', newline='', encoding='utf-8') as file:
         writer = csv.writer(file)
         writer.writerow(new_row)
 
