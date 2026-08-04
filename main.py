@@ -7,8 +7,8 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 import csv
-
 import pyvisa
+from  datetime import datetime
 
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -17,9 +17,9 @@ def is_valid_email(email):
     return bool(EMAIL_PATTERN.match(email))
 
 
-def writeToTXT(elapsed_time, current_value):
+def writeToTXT(elapsed_time, current_value,experiment_file_path):
     new_row = [f"{elapsed_time:.3f}", f"{current_value:.6e}"]
-    with open('data.csv', mode='a', newline='', encoding='utf-8') as file:
+    with open(f'{experiment_file_path}.csv', mode='a', newline='', encoding='utf-8') as file:
         writer = csv.writer(file)
         writer.writerow(new_row)
 
@@ -76,6 +76,7 @@ class VerticalTabsApp(tk.Tk):
         # PyVISA / Keithley instrument variables
         self.rm = None
         self.keithley = None
+        self.experiment_file_path = None
 
         # In-memory copies of the two JSON files
         self.profiles = load_json(PROFILES_PATH, DEFAULT_PROFILES)
@@ -586,7 +587,7 @@ class VerticalTabsApp(tk.Tk):
                 self.save_queue.task_done()
                 break
             elapsed_time, current_value = item
-            writeToTXT(elapsed_time, current_value)
+            writeToTXT(elapsed_time, current_value, self.experiment_file_path)
             self.save_queue.task_done()
 
     def _plotting_worker(self):
@@ -604,7 +605,7 @@ class VerticalTabsApp(tk.Tk):
     # ---------------- Tab 2: Execution & Validation ----------------
     def _start_experiments_thread(self):
         if not self.experiments:
-            messagebox.showwarning("Empty Queue", "There are no experiments in the queue to run.")
+            messagebox.showwarning("Empty Queue", "There are ZERO experiments in the queue to run. SLACKER")
             return
 
         # Start the two consumer threads that will drain save_queue / plot_queue
@@ -616,7 +617,13 @@ class VerticalTabsApp(tk.Tk):
 
         headers = ['Timing', 'Current']
 
-        with open(f'{self.experiment_name} - {time.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.csv', mode='w', newline='', encoding='utf-8') as file:
+        profile_name = "Unknown"
+        if self.selected_profile_index is not None:
+            profile_name = self.profiles[self.selected_profile_index].get("Name", "Unknown")
+
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.experiment_file_path = f'{profile_name} - {timestamp}.csv'
+        with open(f'{profile_name} - {timestamp}.csv', mode='w', newline='', encoding='utf-8') as file:
             writer = csv.writer(file)
             writer.writerow(headers)
 
@@ -626,7 +633,7 @@ class VerticalTabsApp(tk.Tk):
     def _run_experiments(self):
         # Raise error immediately if hardware is disconnected
         if self.keithley is None:
-            error_msg = "Cannot start experiment: Keithley instrument is not connected!"
+            error_msg = "Cannot start experiment: Keithley instrument is not connected! I thought you've done this before?"
             messagebox.showerror("Connection Error", error_msg)
             self.save_queue.put(_STOP)
             self.plot_queue.put(_STOP)
