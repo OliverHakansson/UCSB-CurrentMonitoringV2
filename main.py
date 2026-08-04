@@ -1,10 +1,12 @@
 import json
 import os
+import queue
 import re
 import threading
 import time
 import tkinter as tk
 from tkinter import messagebox, ttk
+import csv
 
 import pyvisa
 
@@ -16,8 +18,16 @@ def is_valid_email(email):
 
 
 def writeToTXT(elapsed_time, current_value):
-    """Helper function to log measurement data to standard output or a text file."""
-    print(f"[DATA] Time: {elapsed_time:.3f} s | Conductivity: {current_value:.6e} A")
+    new_row = [f"{elapsed_time:.3f}", f"{current_value:.6e}"]
+    with open('data.csv', mode='a', newline='', encoding='utf-8') as file:
+        writer = csv.writer(file)
+        writer.writerow(new_row)
+
+
+
+def plotToScreen(elapsed_time, current_value):
+    """Helper function that stands in for updating a live plot."""
+    print(f"[PLOT] Time: {elapsed_time:.3f} s | Conductivity: {current_value:.6e} A")
 
 
 TAB_NAMES = ["Tab 1", "Tab 2", "Tab 3"]
@@ -28,6 +38,9 @@ CHIPS_PATH = os.path.join(SCRIPT_DIR, "chips.json")
 
 DEFAULT_PROFILES = [{"Name": "Me", "Email": "me@example.com"}]
 DEFAULT_CHIPS = [{"Chip Name": "Sample Chip", "Chip Dimensions": "10mm x 10mm"}]
+
+# Sentinel used to tell a consumer thread to stop waiting on its queue.
+_STOP = None
 
 
 def load_json(path, default):
@@ -76,6 +89,15 @@ class VerticalTabsApp(tk.Tk):
         self.voltages = []      # list of floats currently staged
         self.timings = []       # list of floats (seconds) currently staged
         self.experiments = []   # list of {"voltages": [...], "timings": [...], "loops": int}
+
+        # Queues that fan out each data point to the saving and plotting
+        # consumer threads. Two separate queues are used (rather than one
+        # shared queue) so that BOTH consumers see every data point --
+        # a single queue would only let one consumer claim each item.
+        self.save_queue = queue.Queue()
+        self.plot_queue = queue.Queue()
+        self.save_thread = None
+        self.plot_thread = None
 
         self._build_layout()
         self._refresh_visa_resources()
@@ -554,35 +576,65 @@ class VerticalTabsApp(tk.Tk):
             body_frame, text="Run Experiments", command=self._start_experiments_thread
         ).pack(anchor="w", pady=(8, 0))
 
+    # ---------------- Tab 2: Consumer threads (saving / plotting) ----------------
+    def _saving_worker(self):
+        """Consumer thread: pulls data points off save_queue one at a time and
+        logs/saves each one, removing it from the queue before moving to the next."""
+        while True:
+            item = self.save_queue.get()
+            if item is _STOP:
+                self.save_queue.task_done()
+                break
+            elapsed_time, current_value = item
+            writeToTXT(elapsed_time, current_value)
+            self.save_queue.task_done()
+
+    def _plotting_worker(self):
+        """Consumer thread: pulls data points off plot_queue one at a time and
+        plots/prints each one, removing it from the queue before moving to the next."""
+        while True:
+            item = self.plot_queue.get()
+            if item is _STOP:
+                self.plot_queue.task_done()
+                break
+            elapsed_time, current_value = item
+            plotToScreen(elapsed_time, current_value)
+            self.plot_queue.task_done()
+
     # ---------------- Tab 2: Execution & Validation ----------------
     def _start_experiments_thread(self):
         if not self.experiments:
             messagebox.showwarning("Empty Queue", "There are no experiments in the queue to run.")
             return
 
+        # Start the two consumer threads that will drain save_queue / plot_queue
+        # as the producer (the experiment thread) fills them.
+        self.save_thread = threading.Thread(target=self._saving_worker, daemon=True)
+        self.plot_thread = threading.Thread(target=self._plotting_worker, daemon=True)
+        self.save_thread.start()
+        self.plot_thread.start()
+
+        headers = ['Timing', 'Current']
+
+        with open(f'{self.experiment_name} - {time.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.csv', mode='w', newline='', encoding='utf-8') as file:
+            writer = csv.writer(file)
+            writer.writerow(headers)
+
         thread = threading.Thread(target=self._run_experiments, daemon=True)
         thread.start()
 
     def _run_experiments(self):
-        """Executes queued experiments using PyVISA commands to stream data from the Keithley."""
-        print("\n================ STARTING EXPERIMENTS ================")
-        
         # Raise error immediately if hardware is disconnected
         if self.keithley is None:
             error_msg = "Cannot start experiment: Keithley instrument is not connected!"
-            print(f"[Error] {error_msg}")
             messagebox.showerror("Connection Error", error_msg)
+            self.save_queue.put(_STOP)
+            self.plot_queue.put(_STOP)
             raise RuntimeError(error_msg)
-
-        print(f"Session Name : {self.tab2_session_lbl.cget('text')}")
-        print(f"Profile      : {self.tab2_profile_lbl.cget('text')}")
-        print(f"Chip Info    : {self.tab2_chip_lbl.cget('text')}")
-        print("-----------------------------------------------------")
 
         try:
             for idx, exp in enumerate(self.experiments, start=1):
-                print(f"\n--- Running Experiment #{idx} ---")
-                
+
                 experiment_data = {"data_points": []}
                 current_voltages = exp["voltages"]
                 current_timings = exp["timings"]
@@ -597,7 +649,7 @@ class VerticalTabsApp(tk.Tk):
 
                 for h in range(experiment_loops):
                     length = min(len(current_timings), len(current_voltages))
-                    
+
                     for i in range(length):
                         cycle_start_time = time.time()
                         target_voltage = float(current_voltages[i])
@@ -623,13 +675,17 @@ class VerticalTabsApp(tk.Tk):
                                 "conductivity": current_value
                             })
 
-                            writeToTXT(elapsed_time, current_value)
+                            # Push the same data point onto BOTH queues so the
+                            # saving thread and the plotting thread each get
+                            # their own copy to consume independently.
+                            data_point = (elapsed_time, current_value)
+                            self.save_queue.put(data_point)
+                            self.plot_queue.put(data_point)
 
                 self.keithley.write("SOUR:VOLT 0")
                 self.keithley.write("OUTP OFF")
 
         except Exception as e:
-            print(f"[Execution Aborted] {e}")
             if self.keithley is not None:
                 try:
                     self.keithley.write("SOUR:VOLT 0")
@@ -637,7 +693,10 @@ class VerticalTabsApp(tk.Tk):
                 except Exception:
                     pass
         finally:
-            print("\n================ EXPERIMENT RUN COMPLETE ================\n")
+            # Tell both consumer threads there's no more data coming so they
+            # can exit their loops instead of blocking forever on get().
+            self.save_queue.put(_STOP)
+            self.plot_queue.put(_STOP)
 
     # ---------------- Tab 2: Voltages list <-> entry ----------------
     def _add_voltage(self):
