@@ -8,7 +8,9 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 import csv
 import pyvisa
-from  datetime import datetime
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from datetime import datetime
 
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -92,13 +94,19 @@ class VerticalTabsApp(tk.Tk):
         self.experiments = []   # list of {"voltages": [...], "timings": [...], "loops": int}
 
         # Queues that fan out each data point to the saving and plotting
-        # consumer threads. Two separate queues are used (rather than one
-        # shared queue) so that BOTH consumers see every data point --
-        # a single queue would only let one consumer claim each item.
+        # consumers. Two separate queues are used (rather than one shared
+        # queue) so that BOTH consumers see every data point -- a single
+        # queue would only let one consumer claim each item.
         self.save_queue = queue.Queue()
         self.plot_queue = queue.Queue()
         self.save_thread = None
-        self.plot_thread = None
+
+        # Live-plot state (Tab 3). The plot itself is only ever touched from
+        # the main thread; the experiment thread just pushes data points onto
+        # plot_queue, and we drain it periodically via `after()`.
+        self.plot_times = []
+        self.plot_values = []
+        self._plot_polling_active = False
 
         self._build_layout()
         self._refresh_visa_resources()
@@ -233,6 +241,23 @@ class VerticalTabsApp(tk.Tk):
         ttk.Button(btn_frame, text="Refresh", command=self._refresh_visa_resources).pack(side="left", padx=(0, 2))
         ttk.Button(btn_frame, text="Connect", command=self.connect_keithley).pack(side="left", padx=2)
         ttk.Button(btn_frame, text="Disconnect", command=self.disconnect_keithley).pack(side="left", padx=2)
+
+        # Top Right Panel (Tab 3 only): Live Data Plot. Occupies the same
+        # grid cell as the Keithley connection panel above; only one of the
+        # two is visible at a time (toggled in _select_tab).
+        self.side_box_plot = ttk.LabelFrame(side_column, text="Live Data (|Current|)", padding=10)
+        self.side_box_plot.grid(row=0, column=0, sticky="nsew")
+        self.side_box_plot.grid_remove()
+
+        self.fig = Figure(figsize=(4, 3), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_xlabel("Time (s)")
+        self.ax.set_ylabel("|Current| (A)")
+        (self.plot_line,) = self.ax.plot([], [], marker="o", markersize=2, linestyle="-")
+        self.fig.tight_layout()
+
+        self.plot_canvas = FigureCanvasTkAgg(self.fig, master=self.side_box_plot)
+        self.plot_canvas.get_tk_widget().pack(fill="both", expand=True)
 
         # Bottom Right Panel: Logs
         side_box_bottom = ttk.LabelFrame(side_column, text="Logs", padding=8)
@@ -577,7 +602,7 @@ class VerticalTabsApp(tk.Tk):
             body_frame, text="Run Experiments", command=self._start_experiments_thread
         ).pack(anchor="w", pady=(8, 0))
 
-    # ---------------- Tab 2: Consumer threads (saving / plotting) ----------------
+    # ---------------- Tab 2: Consumer thread (saving) & main-thread plot poller ----------------
     def _saving_worker(self):
         """Consumer thread: pulls data points off save_queue one at a time and
         logs/saves each one, removing it from the queue before moving to the next."""
@@ -590,17 +615,42 @@ class VerticalTabsApp(tk.Tk):
             writeToTXT(elapsed_time, current_value, self.experiment_file_path)
             self.save_queue.task_done()
 
-    def _plotting_worker(self):
-        """Consumer thread: pulls data points off plot_queue one at a time and
-        plots/prints each one, removing it from the queue before moving to the next."""
-        while True:
-            item = self.plot_queue.get()
-            if item is _STOP:
+    def _poll_plot_queue(self):
+        """Runs on the main thread via `after()` and drains any data points the
+        experiment thread has pushed onto plot_queue, plotting the absolute
+        value of the current in the Tab 3 live-plot panel. Tkinter/matplotlib
+        widgets are only ever touched here, never from the worker threads."""
+        updated = False
+        try:
+            while True:
+                item = self.plot_queue.get_nowait()
+                if item is _STOP:
+                    self.plot_queue.task_done()
+                    self._plot_polling_active = False
+                    if updated:
+                        self._redraw_plot()
+                    return
+                elapsed_time, current_value = item
+                abs_value = abs(current_value)
+                self.plot_times.append(elapsed_time)
+                self.plot_values.append(abs_value)
+                plotToScreen(elapsed_time, abs_value)
+                updated = True
                 self.plot_queue.task_done()
-                break
-            elapsed_time, current_value = item
-            plotToScreen(elapsed_time, current_value)
-            self.plot_queue.task_done()
+        except queue.Empty:
+            pass
+
+        if updated:
+            self._redraw_plot()
+
+        if self._plot_polling_active:
+            self.after(150, self._poll_plot_queue)
+
+    def _redraw_plot(self):
+        self.plot_line.set_data(self.plot_times, self.plot_values)
+        self.ax.relim()
+        self.ax.autoscale_view()
+        self.plot_canvas.draw_idle()
 
     # ---------------- Tab 2: Execution & Validation ----------------
     def _start_experiments_thread(self):
@@ -608,12 +658,22 @@ class VerticalTabsApp(tk.Tk):
             messagebox.showwarning("Empty Queue", "There are ZERO experiments in the queue to run. SLACKER")
             return
 
-        # Start the two consumer threads that will drain save_queue / plot_queue
-        # as the producer (the experiment thread) fills them.
+        # Start the consumer thread that will drain save_queue as the
+        # producer (the experiment thread) fills it.
         self.save_thread = threading.Thread(target=self._saving_worker, daemon=True)
-        self.plot_thread = threading.Thread(target=self._plotting_worker, daemon=True)
         self.save_thread.start()
-        self.plot_thread.start()
+
+        # Reset the live plot and start draining plot_queue on the main
+        # thread (Tkinter/matplotlib aren't thread-safe, so this can't be
+        # done from a worker thread).
+        self.plot_times = []
+        self.plot_values = []
+        self._redraw_plot()
+        self._plot_polling_active = True
+        self.after(150, self._poll_plot_queue)
+
+        # Jump over to Tab 3 so the live plot is visible while running.
+        self._select_tab("Tab 3")
 
         headers = ['Timing', 'Current']
 
@@ -683,7 +743,7 @@ class VerticalTabsApp(tk.Tk):
                             })
 
                             # Push the same data point onto BOTH queues so the
-                            # saving thread and the plotting thread each get
+                            # saving thread and the plot poller each get
                             # their own copy to consume independently.
                             data_point = (elapsed_time, current_value)
                             self.save_queue.put(data_point)
@@ -700,8 +760,8 @@ class VerticalTabsApp(tk.Tk):
                 except Exception:
                     pass
         finally:
-            # Tell both consumer threads there's no more data coming so they
-            # can exit their loops instead of blocking forever on get().
+            # Tell both consumers there's no more data coming so they can
+            # stop instead of blocking/polling forever.
             self.save_queue.put(_STOP)
             self.plot_queue.put(_STOP)
 
@@ -826,11 +886,15 @@ class VerticalTabsApp(tk.Tk):
 
         self.tab_frames[name].tkraise()
 
-        # Hide top-right panel on Tab 3, show on Tab 1 & Tab 2
+        # On Tab 3, hide the Keithley connection panel and show the live
+        # data plot in its place; on Tab 1 & Tab 2, show the connection
+        # panel and hide the plot.
         if name == "Tab 3":
             self.side_box_top.grid_remove()
+            self.side_box_plot.grid()
         else:
             self.side_box_top.grid()
+            self.side_box_plot.grid_remove()
 
     def _on_close(self):
         """Clean shutdown handler for window exit."""
