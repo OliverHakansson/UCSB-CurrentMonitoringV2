@@ -735,7 +735,9 @@ class VerticalTabsApp(tk.Tk):
                                 experiment_start_time = time.time()
 
                             elapsed_time = time.time() - experiment_start_time
-                            current_value = float(current_val.split(",")[0].split("N")[0])
+                            match = re.match(r"([+-]?\d+\.?\d*(?: Ee[+-]?\d+)?)", current_val.strip(), re.IGNORECASE)
+                            if match:
+                                current_value = float(match.group(1))
 
                             experiment_data["data_points"].append({
                                 "time": elapsed_time,
