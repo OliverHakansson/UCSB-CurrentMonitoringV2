@@ -753,6 +753,9 @@ class VerticalTabsApp(tk.Tk):
                 self.keithley.write("OUTP OFF")
 
         except Exception as e:
+            import traceback
+            print("[EXPERIMENT ERROR] The experiment thread stopped early:")
+            traceback.print_exc()
             if self.keithley is not None:
                 try:
                     self.keithley.write("SOUR:VOLT 0")
