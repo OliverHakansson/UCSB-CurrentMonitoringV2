@@ -5,7 +5,7 @@ import re
 import threading
 import time
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 import csv
 import pyvisa
 from  datetime import datetime
@@ -90,6 +90,9 @@ class VerticalTabsApp(tk.Tk):
         self.voltages = []      # list of floats currently staged
         self.timings = []       # list of floats (seconds) currently staged
         self.experiments = []   # list of {"voltages": [...], "timings": [...], "loops": int}
+
+        # Folder where experiment CSV output files will be saved; defaults to Desktop
+        self.save_folder = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "Desktop"))
 
         # Queues that fan out each data point to the saving and plotting
         # consumer threads. Two separate queues are used (rather than one
@@ -572,10 +575,28 @@ class VerticalTabsApp(tk.Tk):
         exp_scrollbar.grid(row=0, column=1, sticky="ns")
         self.tab2_experiments_listbox.config(yscrollcommand=exp_scrollbar.set)
 
+        # --- Save Folder Selection ---
+        save_folder_frame = ttk.Frame(body_frame)
+        save_folder_frame.pack(fill="x", pady=(8, 0))
+        save_folder_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(save_folder_frame, text="Save Folder:").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.tab2_save_folder_entry = ttk.Entry(save_folder_frame, textvariable=self.save_folder)
+        self.tab2_save_folder_entry.grid(row=0, column=1, sticky="ew")
+        ttk.Button(
+            save_folder_frame, text="Browse...", command=self._choose_save_folder
+        ).grid(row=0, column=2, padx=(6, 0))
+
         # --- Run Experiments Button ---
         ttk.Button(
             body_frame, text="Run Experiments", command=self._start_experiments_thread
         ).pack(anchor="w", pady=(8, 0))
+
+    def _choose_save_folder(self):
+        """Opens a directory picker for choosing where experiment CSVs are saved."""
+        chosen = filedialog.askdirectory(initialdir=self.save_folder.get() or os.path.expanduser("~"))
+        if chosen:
+            self.save_folder.set(chosen)
 
     # ---------------- Tab 2: Consumer threads (saving / plotting) ----------------
     def _saving_worker(self):
@@ -622,8 +643,10 @@ class VerticalTabsApp(tk.Tk):
             profile_name = self.profiles[self.selected_profile_index].get("Name", "Unknown")
 
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        self.experiment_file_path = f'{profile_name} - {timestamp}.csv'
-        with open(f'{profile_name} - {timestamp}.csv', mode='w', newline='', encoding='utf-8') as file:
+        save_folder = self.save_folder.get().strip() or os.path.expanduser("~/Desktop")
+        os.makedirs(save_folder, exist_ok=True)
+        self.experiment_file_path = os.path.join(save_folder, f'{profile_name} - {timestamp}.csv')
+        with open(self.experiment_file_path, mode='w', newline='', encoding='utf-8') as file:
             writer = csv.writer(file)
             writer.writerow(headers)
 
