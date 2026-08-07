@@ -5,7 +5,7 @@ import re
 import threading
 import time
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 import csv
 import pyvisa
 from matplotlib.figure import Figure
@@ -71,6 +71,16 @@ class VerticalTabsApp(tk.Tk):
         self.title("Pennathur Lab Current Monitoring GUI by Oliver Hakansson TM")
         self.geometry("900x550")
 
+        # --- Application color palette ---
+        self.colors = {
+            "background": "#EBF4DD",
+            "secondary": "#90AB8B",
+            "accent": "#5A7863",
+            "dark": "#3B4953",
+            "white": "#F8FBF3",
+        }
+        self.configure(bg=self.colors["background"])
+
         self.active_tab = tk.StringVar(value="Tab 1")
         self.tab_buttons = {}
         self.tab_frames = {}  # name -> frame containing that tab's widgets
@@ -92,6 +102,8 @@ class VerticalTabsApp(tk.Tk):
         self.voltages = []      # list of floats currently staged
         self.timings = []       # list of floats (seconds) currently staged
         self.experiments = []   # list of {"voltages": [...], "timings": [...], "loops": int}
+
+        self.save_folder = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "Desktop"))
 
         # Queues that fan out each data point to the saving and plotting
         # consumers. Two separate queues are used (rather than one shared
@@ -151,7 +163,7 @@ class VerticalTabsApp(tk.Tk):
             idn = self.keithley.query("*IDN?")
             print(f"[Keithley] Successfully connected: {idn.strip()}")
 
-            self.status_lbl.config(text="Status: Connected", foreground="green")
+            self.status_lbl.config(text="Status: Connected", foreground=self.colors["accent"])
             return True
         except Exception as e:
             messagebox.showerror("Connection Failed", f"Could not connect to {selected_address}:\n{e}")
@@ -168,7 +180,7 @@ class VerticalTabsApp(tk.Tk):
             finally:
                 self.keithley = None
 
-        self.status_lbl.config(text="Status: Disconnected", foreground="red")
+        self.status_lbl.config(text="Status: Disconnected", foreground=self.colors["dark"])
 
     # ---------------- Layout Construction ----------------
     def _build_layout(self):
@@ -176,12 +188,57 @@ class VerticalTabsApp(tk.Tk):
         container.pack(fill="both", expand=True)
 
         # --- Left: vertical tab buttons ---
-        style = ttk.Style()
-        style.configure(
-            "Tab.TButton",
-            padding=0,
-            font=("TkDefaultFont", 8),
-        )
+        style = ttk.Style(self)
+        style.theme_use("clam")
+
+        # Palette styling only — existing layout and widget placement are unchanged.
+        style.configure(".", background=self.colors["background"],
+                        foreground=self.colors["dark"],
+                        fieldbackground=self.colors["white"])
+        style.configure("TFrame", background=self.colors["background"])
+        style.configure("TLabel", background=self.colors["background"],
+                        foreground=self.colors["dark"])
+        style.configure("TLabelframe", background=self.colors["background"],
+                        foreground=self.colors["dark"],
+                        bordercolor=self.colors["secondary"])
+        style.configure("TLabelframe.Label", background=self.colors["background"],
+                        foreground=self.colors["dark"],
+                        font=("TkDefaultFont", 9, "bold"))
+        style.configure("TEntry", fieldbackground=self.colors["white"],
+                        foreground=self.colors["dark"],
+                        bordercolor=self.colors["secondary"])
+        style.configure("TCombobox", fieldbackground=self.colors["white"],
+                        foreground=self.colors["dark"],
+                        background=self.colors["white"],
+                        arrowcolor=self.colors["accent"])
+        style.configure("TButton", background=self.colors["secondary"],
+                        foreground=self.colors["dark"],
+                        bordercolor=self.colors["accent"],
+                        lightcolor=self.colors["secondary"],
+                        darkcolor=self.colors["accent"],
+                        padding=(8, 5),
+                        font=("TkDefaultFont", 9, "bold"))
+        style.map("TButton",
+                  background=[("active", self.colors["accent"]),
+                              ("pressed", self.colors["accent"])],
+                  foreground=[("active", self.colors["white"]),
+                              ("pressed", self.colors["white"])])
+        style.configure("Tab.TButton", padding=0,
+                        font=("TkDefaultFont", 8, "bold"),
+                        background=self.colors["secondary"],
+                        foreground=self.colors["dark"],
+                        bordercolor=self.colors["accent"])
+        style.map("Tab.TButton",
+                  background=[("active", self.colors["accent"]),
+                              ("pressed", self.colors["accent"])],
+                  foreground=[("active", self.colors["white"]),
+                              ("pressed", self.colors["white"])])
+
+        # Native Tk listboxes use the same palette.
+        self.option_add("*Listbox.background", self.colors["white"])
+        self.option_add("*Listbox.foreground", self.colors["dark"])
+        self.option_add("*Listbox.selectBackground", self.colors["accent"])
+        self.option_add("*Listbox.selectForeground", self.colors["white"])
 
         tab_bar = ttk.Frame(container)
         tab_bar.pack(side="left", fill="y", padx=(0, 10))
@@ -224,7 +281,7 @@ class VerticalTabsApp(tk.Tk):
         self.status_lbl = ttk.Label(
             self.side_box_top,
             text="Status: Disconnected",
-            foreground="red",
+            foreground=self.colors["dark"],
             font=("TkDefaultFont", 9, "bold"),
         )
         self.status_lbl.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
@@ -249,15 +306,26 @@ class VerticalTabsApp(tk.Tk):
         self.side_box_plot.grid(row=0, column=0, sticky="nsew")
         self.side_box_plot.grid_remove()
 
-        self.fig = Figure(figsize=(4, 3), dpi=100)
+        self.fig = Figure(figsize=(4, 3), dpi=100,
+                          facecolor=self.colors["background"])
         self.ax = self.fig.add_subplot(111)
-        self.ax.set_xlabel("Time (s)")
-        self.ax.set_ylabel("|Current| (A)")
-        (self.plot_line,) = self.ax.plot([], [], marker="o", markersize=2, linestyle="-")
+        self.ax.set_facecolor(self.colors["white"])
+        self.ax.set_xlabel("Time (s)", color=self.colors["dark"])
+        self.ax.set_ylabel("|Current| (A)", color=self.colors["dark"])
+        self.ax.tick_params(colors=self.colors["dark"])
+        for spine in self.ax.spines.values():
+            spine.set_color(self.colors["secondary"])
+        (self.plot_line,) = self.ax.plot(
+            [], [], marker="o", markersize=2, linestyle="-",
+            color=self.colors["accent"])
         self.fig.tight_layout()
 
         self.plot_canvas = FigureCanvasTkAgg(self.fig, master=self.side_box_plot)
         self.plot_canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        # Tab 3 has no content widgets of its own; the graph is the complete
+        # upper-right section and Logs remains the complete lower-right section.
+
 
         # Bottom Right Panel: Logs
         side_box_bottom = ttk.LabelFrame(side_column, text="Logs", padding=8)
@@ -271,7 +339,11 @@ class VerticalTabsApp(tk.Tk):
         box_frame.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(0, 8))
         box_frame.columnconfigure(0, weight=1)
 
-        listbox = tk.Listbox(box_frame, height=height, exportselection=False)
+        listbox = tk.Listbox(box_frame, height=height, exportselection=False,
+                    bg=self.colors["white"], fg=self.colors["dark"],
+                    selectbackground=self.colors["accent"],
+                    selectforeground=self.colors["white"],
+                    relief="flat", bd=0)
         listbox.grid(row=0, column=0, sticky="ew")
 
         scrollbar = ttk.Scrollbar(box_frame, orient="vertical", command=listbox.yview)
@@ -537,7 +609,11 @@ class VerticalTabsApp(tk.Tk):
         voltages_frame.pack(fill="x", pady=(0, 8))
         voltages_frame.columnconfigure(0, weight=1)
 
-        self.tab2_voltage_listbox = tk.Listbox(voltages_frame, height=4, exportselection=False)
+        self.tab2_voltage_listbox = tk.Listbox(voltages_frame, height=4, exportselection=False,
+            bg=self.colors["white"], fg=self.colors["dark"],
+            selectbackground=self.colors["accent"],
+            selectforeground=self.colors["white"],
+            relief="flat", bd=0)
         self.tab2_voltage_listbox.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 4))
 
         self.tab2_voltage_entry = ttk.Entry(voltages_frame, width=12)
@@ -556,7 +632,11 @@ class VerticalTabsApp(tk.Tk):
         timings_frame.pack(fill="x", pady=(0, 8))
         timings_frame.columnconfigure(0, weight=1)
 
-        self.tab2_timing_listbox = tk.Listbox(timings_frame, height=4, exportselection=False)
+        self.tab2_timing_listbox = tk.Listbox(timings_frame, height=4, exportselection=False,
+            bg=self.colors["white"], fg=self.colors["dark"],
+            selectbackground=self.colors["accent"],
+            selectforeground=self.colors["white"],
+            relief="flat", bd=0)
         self.tab2_timing_listbox.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 4))
 
         self.tab2_timing_entry = ttk.Entry(timings_frame, width=12)
@@ -588,7 +668,11 @@ class VerticalTabsApp(tk.Tk):
         experiments_frame.columnconfigure(0, weight=1)
         experiments_frame.rowconfigure(0, weight=1)
 
-        self.tab2_experiments_listbox = tk.Listbox(experiments_frame, height=6, exportselection=False)
+        self.tab2_experiments_listbox = tk.Listbox(experiments_frame, height=6, exportselection=False,
+            bg=self.colors["white"], fg=self.colors["dark"],
+            selectbackground=self.colors["accent"],
+            selectforeground=self.colors["white"],
+            relief="flat", bd=0)
         self.tab2_experiments_listbox.grid(row=0, column=0, sticky="nsew")
 
         exp_scrollbar = ttk.Scrollbar(
@@ -597,11 +681,27 @@ class VerticalTabsApp(tk.Tk):
         exp_scrollbar.grid(row=0, column=1, sticky="ns")
         self.tab2_experiments_listbox.config(yscrollcommand=exp_scrollbar.set)
 
+        save_folder_frame = ttk.Frame(body_frame)
+        save_folder_frame.pack(fill="x", pady=(8, 0))
+        save_folder_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(save_folder_frame, text="Save Folder:").grid(row=0, column=0, sticky="w", padx = (0,6))
+
+        self.tab2_save_folder_entry = ttk.Entry(save_folder_frame, textvariable=self.save_folder)
+        self.tab2_save_folder_entry.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+        ttk.Button(save_folder_frame, text="Browse...", command=self._choose_save_folder).grid(row=0, column=2, padx=(6, 0))
+
         # --- Run Experiments Button ---
         ttk.Button(
             body_frame, text="Run Experiments", command=self._start_experiments_thread
         ).pack(anchor="w", pady=(8, 0))
 
+
+    def _choose_save_folder(self):
+        folder = filedialog.askdirectory(title="Select Save Folder", initialdir=self.save_folder.get())
+        if folder:
+            self.save_folder.set(folder)
     # ---------------- Tab 2: Consumer thread (saving) & main-thread plot poller ----------------
     def _saving_worker(self):
         """Consumer thread: pulls data points off save_queue one at a time and
@@ -682,8 +782,11 @@ class VerticalTabsApp(tk.Tk):
             profile_name = self.profiles[self.selected_profile_index].get("Name", "Unknown")
 
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        self.experiment_file_path = f'{profile_name} - {timestamp}.csv'
-        with open(f'{profile_name} - {timestamp}.csv', mode='w', newline='', encoding='utf-8') as file:
+        save_folder = self.save_folder.get().strip() or os.path.expanduser("~/Desktop")
+        os.makedirs(save_folder, exist_ok=True)
+        self.experiment_file_path = os.path.join(save_folder, f'{profile_name} - {timestamp}.csv')
+
+        with open(self.experiment_file_path, mode='w', newline='', encoding='utf-8') as file:
             writer = csv.writer(file)
             writer.writerow(headers)
 
@@ -860,25 +963,11 @@ class VerticalTabsApp(tk.Tk):
 
     # ---------------- Tab 3 Construction ----------------
     def _build_tab3(self, parent):
+        # Tab 3 content area is intentionally empty.
+        # The right-hand top panel is the live graph and the lower panel is logs.
         frame = ttk.Frame(parent)
         frame.grid(row=0, column=0, sticky="nsew")
         self.tab_frames["Tab 3"] = frame
-
-        ttk.Label(frame, text="Search:").grid(row=0, column=0, sticky="w", pady=4)
-        self.tab3_search_entry = ttk.Entry(frame)
-        self.tab3_search_entry.grid(row=0, column=1, sticky="ew", pady=4)
-        ttk.Button(frame, text="Go", command=self._tab3_search).grid(
-            row=0, column=2, padx=(4, 0)
-        )
-
-        self.tab3_result_label = ttk.Label(frame, text="")
-        self.tab3_result_label.grid(row=1, column=0, columnspan=3, sticky="w", pady=8)
-
-        frame.columnconfigure(1, weight=1)
-
-    def _tab3_search(self):
-        query = self.tab3_search_entry.get()
-        self.tab3_result_label.config(text=f"You searched for: {query}")
 
     def _select_tab(self, name):
         self.active_tab.set(name)
